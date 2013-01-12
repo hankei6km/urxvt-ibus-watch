@@ -1,0 +1,564 @@
+#!/bin/usr/perl
+# IBusの状態を表示/制御するための、urxvt用perl拡張.
+# @author hankei6km
+# @copyright (c) 2013 hankei6km
+# @license MIT License (http://opensource.org/licenses/mit-license.php)
+use strict;
+
+use Glib::Object::Introspection;
+Glib::Object::Introspection->setup(
+  basename => "GLib", 
+  version => "2.0", 
+  package => "GLib");
+Glib::Object::Introspection->setup(
+  basename => "Gdk", 
+  version => "3.0", 
+  package => "Gdk");
+Glib::Object::Introspection->setup(
+  basename => "GdkX11", 
+  version => "3.0", 
+  package => "GdkX11");
+Glib::Object::Introspection->setup(
+  basename => "IBus", 
+  version => "1.0", 
+  package => "IBus");
+
+IBus::init();
+my $bus = new IBus::Bus;
+
+# IBus関連のメソッド実体,
+# (ic:InputContextのメソッド使う,ge:GlobalEngineを使う)
+my $ibus_get_input_context_proc;
+my $ibus_enable_proc;
+my $ibus_disable_proc;
+my $ibus_is_enabled_proc;
+# キーハンドラー関連のメソッド実体.
+# (ic:InputContextのメソッド使う,ge:GlobalEngineを使う)
+my $on_key_press_proc;
+my $on_key_release_proc;
+
+# IBusのグローバルエンジン切り替え管理用.
+my $enabled_engine_name = 'mozc-jp';
+my $disabled_engine_name = 'xkb:jp::jpn';
+
+# (on_init時にurxvt用の定義から変換されたものが設定される)
+my $ibus_enable_key = IBus->Henkan;
+
+# カーソルの色指定(rend?).
+my $cursor_fg = '1';
+my $cursor_bg = '3';
+
+# urxvt用の変換キー(keycode)設定.
+my $ibus_enable_key_on_urxvt = 100;
+my $ibus_enable_key_state_on_urxvt = 0;
+my $ibus_disable_key_on_urxvt = 102;
+my $ibus_disable_key_state_on_urxvt = 0;
+my $ibus_toggle_key_on_urxvt = 49;
+my $ibus_toggle_key_state_on_urxvt = 0;
+
+
+# window管理.
+my $gdk_win;
+
+# キーのマスク保持
+my $modNumLockMask;
+
+# エンジン名管理
+# (bus->get_global_engineを使うとメモリーを結構消費するので独自管理)
+my $global_engine_name = '';
+
+# InputContext管理
+# (IBus::InputContext::get_input_contextを使うと
+#  メモリーを結構消費するので独自管理)
+my $cur_input_context = 0;
+
+# カーソル位置を補正するか? URxvt.preeditType によって決定.
+my $is_set_cursor_location = 0; 
+
+# カーソル再描画管理用.
+my $prev_stat = '';
+my $prev_text = '';
+my $prev_col = -1;
+my $prev_row = -1;
+my $prev_win_y = -1;
+my $prev_win_x = -1;
+my $cursor_overlay_rend;
+
+# focus_inされたかの管理用.
+# on_refresh_end の時点で'in'の場合、IBusをdisable.
+my $disable_by_focus = '';
+
+# IBusで入力中か?
+# 入力中のときは`on`が代入されてる.
+my $is_xim_preedit = '';
+
+sub ibus_reconnect(){
+  if(!$bus->is_connected){
+    # ibus-daemonが再起動された.たぶん.
+    warn('$bus is disconnected. re-new $bus.');
+    $bus->destroy();
+    $bus = new IBus::Bus;
+    $cur_input_context = 0;
+  }
+}
+
+sub ibus_get_input_context_ic(){
+  # get_input_context を繰り替えしても大丈夫そうな環境もあるが、
+  # やはりなかなか開放されない環境もあるので、
+  # これは使わずに ge 版の方で再利用することにする.
+  ibus_reconnect();
+
+  my $bus_ci = $bus->current_input_context();
+  my $bus_co = $bus->get_connection();
+  my $input_context = IBus::InputContext::get_input_context( # ここで消費する.
+    $bus_ci, 
+    $bus_co);
+  GLib::free($bus_ci);
+
+  $input_context;
+}
+sub ibus_get_input_context_ge(){
+  ibus_reconnect();
+
+  if(!$cur_input_context){
+    my $bus_ci = $bus->current_input_context();
+    my $bus_co = $bus->get_connection();
+    # これも消費するが、めったにないはずなので.
+    $cur_input_context = IBus::InputContext::get_input_context(
+      $bus_ci, 
+      $bus_co);
+    GLib::free($bus_ci);
+  }
+
+  $cur_input_context;
+}
+sub ibus_get_input_context(){
+  no strict 'refs';
+  &$ibus_get_input_context_proc();
+}
+
+sub ibus_enable_ic(){
+  my ($term, $force_enable) = @_;
+
+  ibus_reconnect();
+
+  if($force_enable){
+    my $input_context = ibus_get_input_context();
+    if($input_context){
+      $input_context->enable();
+      #$input_context->destroy();
+    }
+  }
+}
+sub ibus_enable_ge(){
+  my ($term, $force_enable) = @_;
+
+  ibus_reconnect();
+
+  $bus->set_global_engine($enabled_engine_name);
+  $global_engine_name = $enabled_engine_name;
+  if($force_enable){
+    my $input_context = ibus_get_input_context();
+    if($input_context){
+      # mozc-jp はエンジンを再セットしても前回の状態を保持しているので、
+      # 変換キーを押したことにする.
+      $input_context->process_key_event($ibus_enable_key, 0, 0);
+      #$input_context->destroy();
+    }
+  }
+}
+sub ibus_enable(){
+  no strict 'refs';
+  &$ibus_enable_proc(@_);
+}
+
+sub ibus_disable_ic(){
+  ibus_reconnect();
+
+    my $input_context = ibus_get_input_context();
+    if($input_context){
+      $input_context->disable();
+      #$input_context->destroy();
+    }
+}
+sub ibus_disable_ge(){
+  ibus_reconnect();
+
+  $bus->set_global_engine($disabled_engine_name);
+  $global_engine_name = $disabled_engine_name;
+}
+sub ibus_disable(){
+  no strict 'refs';
+  &$ibus_disable_proc(@_);
+}
+
+sub ibus_toggle(){
+  my ($term) = @_;
+  ibus_reconnect();
+
+  if($term->ibus_is_enabled()){
+    $term->ibus_disable();
+  }else{
+    $term->ibus_enable(1);
+  }
+}
+
+sub ibus_is_enabled_ic(){
+  my $ret = 0;
+  ibus_reconnect();
+
+  my $input_context = ibus_get_input_context();
+  if($input_context){
+    $ret = $input_context->is_enabled();
+    #$input_context->destroy();
+  }
+  $ret;
+}
+sub ibus_is_enabled_ge(){
+  ibus_reconnect();
+
+  ## エンジン名で判定する.
+  #my $engine_desc = $bus->get_global_engine(); # ここで消費する.
+  #my $engine_name = $engine_desc->get_name();
+  #my $ret = $engine_name eq $enabled_engine_name;
+  #GLib::free($engine_name);
+  #$engine_desc->destroy();
+  #$ret
+  $global_engine_name eq $enabled_engine_name;
+}
+sub ibus_is_enabled(){
+  no strict 'refs';
+  my $ret = &$ibus_is_enabled_proc();
+}
+
+sub ibus_set_cursor_location(){
+  my ($term, $row, $col) = @_;
+
+  if($is_set_cursor_location){
+    # urxvt のウィンドウ位置を取得.
+    my @obj=$gdk_win->get_origin();
+    my ($val, $win_x, $win_y)=@obj;
+    GLib::free(@obj);
+
+    # 前回と位置が変わっているときだけ更新.
+    if($prev_win_x ne $win_x or $prev_win_y ne $win_y or
+      $prev_col ne $col or $prev_row ne $row){
+
+      my $input_context = ibus_get_input_context();
+      if($input_context){
+
+        # カーソルの座標を取得する.
+        my $fwidth = $term->fwidth();
+        my $fheight = $term->fheight();
+        my $cur_x = $win_x + ($col * $fwidth);
+        my $cur_y = $win_y + ($row * $fheight);
+
+        $input_context->set_cursor_location(
+          $cur_x, $cur_y , $fwidth, $fheight
+        );
+        #$input_context->destroy();
+      }
+      $prev_win_x = $win_x;
+      $prev_win_y = $win_y;
+      # $prev_colと$prev_rowは呼び出し元で更新している.
+    }
+  }
+  ()
+}
+
+sub refresh(){
+  my ($term) = @_;
+
+  my $enabled = ibus_is_enabled();
+  if(!$term->focus or $is_xim_preedit){
+    $enabled = 0;
+  }
+  if($enabled){
+    my ($row, $col) = $term->screen_cur();
+    my $text = substr($term->ROW_t($row), $col, 1);
+    # ステータスかテキスト、位置が変更されていたら再描画.
+    if($prev_stat ne 'enabled' or 
+      $prev_text ne $text or
+      $prev_col ne $col or $prev_row ne $row){
+
+      # overlay を一旦消す(位置を移動するのでsetでは対応できない)
+      #$term->{overlay}->hide();
+      delete $term->{overlay};
+
+      # overlay をカーソル位置に作成.
+      # テキストもカーソル位置から転写.
+      $term->{overlay} = $term->overlay($col, $row, 1, 1, $cursor_overlay_rend, 0);
+      $term->{overlay}->set(0, 0, $text);
+
+      $term->ibus_set_cursor_location($row, $col);
+
+      $prev_stat = 'enabled';
+      $prev_text = $text;
+      $prev_col = $col;
+      $prev_row = $row;
+    }elsif($prev_text ne $text){
+      # テキストをカーソル位置から転写.
+      $term->{overlay}->set(0, 0, $text);
+
+      $prev_stat = 'enabled';
+      $prev_text = $text;
+    }
+  }else{
+    if($prev_stat ne 'disabled'){
+      $term->{overlay}->hide();
+
+      $prev_stat = 'disabled';
+    }
+  }
+  ()
+}
+
+sub on_start(){
+  my ($term) = @_;
+
+  # リソースから設定の読み込み.
+  my $tmp = '';
+  # エンジン名関連.
+  $tmp = $term->x_resource('ibus-watch.enabled_engine_name');
+  if($tmp){
+    $enabled_engine_name = $tmp;
+  }
+  $tmp = $term->x_resource('ibus-watch.disabled_engine_name');
+  if($tmp){
+    $disabled_engine_name = $tmp;
+  }
+
+  # カーソル色.
+  $tmp = $term->x_resource('ibus-watch.cursor_rend');
+  if($tmp){
+    # 文字列をパース.
+    my ($mask, $fg, $bg, $failed) =  urxvt::rend2mask($tmp);
+    if(!@$failed){
+      $cursor_fg = $fg ? $fg : $cursor_fg;
+      $cursor_bg = $bg ? $bg : $cursor_bg;
+    }else{
+      warn('Parse failed:' . join(',', @$failed));
+    }
+  }
+
+  # キー関連.
+  $tmp = $term->x_resource('ibus-watch.ibus_enable_key_keycode');
+  if($tmp){
+    $ibus_enable_key_on_urxvt = $tmp;
+  }
+  $tmp = $term->x_resource('ibus-watch.ibus_enable_key_state');
+  if($tmp){
+    $ibus_enable_key_state_on_urxvt = $tmp;
+  }
+
+  $tmp = $term->x_resource('ibus-watch.ibus_disable_key_keycode');
+  if($tmp){
+    $ibus_disable_key_on_urxvt = $tmp;
+  }
+  $tmp = $term->x_resource('ibus-watch.ibus_disable_key_state');
+  if($tmp){
+    $ibus_disable_key_state_on_urxvt = $tmp;
+  }
+
+  $tmp = $term->x_resource('ibus-watch.ibus_toggle_key_keycode');
+  if($tmp){
+    $ibus_toggle_key_on_urxvt = $tmp;
+  }
+  $tmp = $term->x_resource('ibus-watch.ibus_toggle_key_state');
+  if($tmp){
+    $ibus_toggle_key_state_on_urxvt = $tmp;
+  }
+
+  if($term->x_resource('preeditType') eq 'OnTheSpot'){
+    $is_set_cursor_location = 1;
+  }
+
+  # GDKでのwindw取得.
+  my $disp = Gdk::Display::open($term->display_id);
+  $gdk_win = GdkX11::X11Window->foreign_new_for_display($disp, $term->vt());
+
+  # メソッドの割り当て.
+  if (exists &IBus::InputContext::is_enabled){
+    $ibus_get_input_context_proc = 'ibus_get_input_context_ge'; # icでも再利用
+    $ibus_enable_proc = 'ibus_enable_ic';
+    $ibus_disable_proc = 'ibus_disable_ic';
+    $ibus_is_enabled_proc = 'ibus_is_enabled_ic';
+    $on_key_press_proc = 'on_key_press_release_ic';
+    $on_key_release_proc = 'on_key_press_release_ic';
+    $term->{timer} = urxvt::timer
+    ->new
+    ->start(1 + urxvt::NOW)
+    ->cb (sub {
+        # 環境によって、起動直後に取得した InputContext は使えないので、
+        # 少しずらして再取得を行うようにする.
+        # これまたタイミング依存.
+        $cur_input_context = 0;
+        $term->refresh();
+      });
+  }else{
+    $ibus_get_input_context_proc = 'ibus_get_input_context_ge';
+    $ibus_enable_proc = 'ibus_enable_ge';
+    $ibus_disable_proc = 'ibus_disable_ge';
+    $ibus_is_enabled_proc = 'ibus_is_enabled_ge';
+    $on_key_press_proc = 'on_key_press_ge';
+    $on_key_release_proc = 'on_key_release_ge';
+
+    # 最初はdisable.
+    $bus->set_global_engine($disabled_engine_name);
+
+    # ge形式ではIBusのenableにはkeysymも使うので変換.
+    # まずはグローバルエンジンからキーマップのファイル名を取得
+    # ここでもメモリーを結構消費するが、初回だけなので.
+    my $engine_desc = $bus->get_global_engine();
+    my $keymap_file_name = $engine_desc->get_layout();
+
+    # girではibus_keymap_getは使えないっぽいので、コンストラクタを使う.
+    my $km = new IBus::Keymap($keymap_file_name);
+    $km->lookup_keysym($ibus_enable_key_state_on_urxvt, 
+      $ibus_enable_key_state_on_urxvt);
+    $km->destroy();
+
+    GLib::free($keymap_file_name);
+    $engine_desc->destroy();
+  }
+
+  # キーのマスク取得
+  $modNumLockMask = $term->ModNumLockMask();
+
+  # カーソル用のrend.
+  $cursor_overlay_rend = urxvt::OVERLAY_RSTYLE;
+  $cursor_overlay_rend = urxvt::SET_FGCOLOR($cursor_overlay_rend, $cursor_fg);
+  $cursor_overlay_rend = urxvt::SET_BGCOLOR($cursor_overlay_rend, $cursor_bg);
+
+  # ダミーのoverlay作成.
+  # refreshで最初にdeleteされる用.
+  $term->{overlay} = $term->overlay(0, 0, 1, 1, $cursor_overlay_rend, 0);
+  $term->{overlay}->hide();
+
+}
+
+sub on_refresh_begin(){
+  my ($term) = @_;
+  $term->refresh();
+}
+
+sub on_refresh_end(){
+  my ($term) = @_;
+
+  if($disable_by_focus eq 'in'){
+    # フラグがセットされていたのでdisable.
+    $disable_by_focus = '';
+    ibus_disable();
+    $term->refresh();
+  }
+  ()
+}
+
+sub on_focus_in(){
+  # focus_inの時点ではdisableできないので、フラグのセット.
+  $disable_by_focus = 'in';
+  # ウィンドウ位置はリセット.
+  # カーソルによる位置補正を強制的に実行させるため.
+  # (これは別途フラグ管理するか?)
+  $prev_win_y = -1;
+  $prev_win_x = -1;
+  ()
+}
+
+sub on_focus_out(){
+  my ($term) = @_;
+  ibus_reconnect();
+
+  # focus_outした後は、
+  # 他のアプリでグローバルエンジンが利用できるように、
+  # enableにする(ただし、エンジン内でのIMEオンは行わない).
+  $term->ibus_enable(0);
+  ()
+}
+
+
+sub on_xim_preedit_start(){
+  # IBu(xim)により何か入力さえれている.
+  # これを利用するにはurxvt起動時に-pt OnTheSpotが必要.
+  $is_xim_preedit = 'on';
+  ()
+}
+
+sub on_xim_preedit_done(){
+  $is_xim_preedit = '';
+  ()
+}
+
+
+sub on_key_press_release_ic(){
+  my ($term, $event, $keysym, $octet) = @_;
+
+  # pressとrelease時点ではis_enabledが変化しないのでタイマー処理.
+  # (つまりタイミング依存)
+  # input_contextのsignalを使うには、
+  # GLibのイベントループが必要そうなので、とりあえず見送り.
+  $term->refresh();
+  $term->{timer}->stop();
+  delete $term->{timer};
+  $term->{timer} = urxvt::timer
+        ->new
+        ->start(0.3 + urxvt::NOW)
+        ->cb (sub {
+          $term->refresh();
+      });
+}
+sub on_key_press_ge(){
+  my ($term, $event, $keysym, $octet) = @_;
+  my $state = ($event->{state} | $modNumLockMask) ^ $modNumLockMask;
+
+  if($event->{keycode} eq $ibus_enable_key_on_urxvt and 
+     $state eq $ibus_enable_key_state_on_urxvt){
+    $term->ibus_enable(1);
+    $term->refresh();
+  }
+}
+sub on_key_press(){
+  my ($term, $event, $keysym, $octet) = @_;
+  my $state = ($event->{state} | $modNumLockMask) ^ $modNumLockMask;
+
+  if($event->{keycode} eq 9){
+    # ESCキーを押されたとき(stateは見ない).
+    $term->ibus_disable();
+    $term->refresh();
+  }
+
+  no strict 'refs';
+  &$on_key_press_proc(@_);
+
+  ()
+}
+
+
+sub on_key_release_ge(){
+  my ($term, $event, $keysym, $octet) = @_;
+  my $state = ($event->{state} | $modNumLockMask) ^ $modNumLockMask;
+
+  # pressの時点ではIBus側にフックされるので、
+  # toggle と disableのキー処理はreleaseまで待つ.
+  # ただし、preedit中は処理しない.
+  if($is_xim_preedit eq ''){
+    if($event->{keycode} eq $ibus_disable_key_on_urxvt and
+      $state eq $ibus_disable_key_state_on_urxvt){
+      $term->ibus_disable();
+      $term->refresh();
+    }
+    if($event->{keycode} eq $ibus_toggle_key_on_urxvt and
+      $state eq $ibus_toggle_key_state_on_urxvt){
+      $term->ibus_toggle();
+      $term->refresh();
+    }
+  }
+
+}
+sub on_key_release(){
+  no strict 'refs';
+  &$on_key_release_proc(@_);
+
+  ()
+}
+
